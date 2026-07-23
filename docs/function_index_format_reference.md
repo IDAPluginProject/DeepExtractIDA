@@ -51,9 +51,12 @@ The index maps each function name to the generated `.cpp` file(s) containing it,
   - `CRT` — C/C++ runtime support (`__scrt_`, `__acrt_`, `_CRT_`)
   - `ETW/TraceLogging` — TraceLogging and ETW helpers (`_tlgWrite`, `TraceLoggingCorrelationVector::`)
   - `null` — No library match (treat as application code)
-- **`function_id`**: Integer primary key from `functions.function_id`.
+- **`function_id`**: Integer primary key from `functions.function_id`. This is a sequential identifier (assigned in address order), **not** a memory address.
+- **`address`**: Hex string of the function's true start address (e.g., `"0x1401F0CC8"`), from `functions.function_address`. Present in entries produced by the ASM index path; may be absent/`null` for entries from databases extracted before schema v2.
 - **`has_decompiled`**: Boolean flag. `true` means valid decompiled output was available and the function was emitted to a `.cpp` file; `false` means decompilation failed or was unavailable.
 - **`has_assembly`**: Boolean flag. `true` means `functions.assembly_code` was present for this function; `false` means no assembly listing was stored.
+
+> **ASM index variant**: When `--generate-asm` is used, entries use the key `asm_files` (list of `.asm` filenames) instead of `files`, omit `has_decompiled`, and include the `address` field. In combined C++/ASM runs the address is backfilled into the shared index during the ASM merge step.
 
 ### Examples
 

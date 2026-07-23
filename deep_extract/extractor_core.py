@@ -87,11 +87,11 @@ def load_dangerous_api_calls(file_path: str = "dangerous_apis.json") -> List[str
                 with open(api_list_path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                 if isinstance(data, list):
-                    _DANGEROUS_API_CACHE[file_path] = [str(item).strip() for item in data if str(item).strip()]
+                    _DANGEROUS_API_CACHE[file_path] = [str(item).strip().lower() for item in data if str(item).strip()]
                     return list(_DANGEROUS_API_CACHE[file_path])
             else:
                 with open(api_list_path, 'r', encoding='utf-8') as f:
-                    _DANGEROUS_API_CACHE[file_path] = [line.strip() for line in f if line.strip()]
+                    _DANGEROUS_API_CACHE[file_path] = [line.strip().lower() for line in f if line.strip()]
                     return list(_DANGEROUS_API_CACHE[file_path])
     except Exception as e:
         debug_print(f"WARNING - Could not load dangerous API calls file '{file_path}': {e}")

@@ -287,11 +287,10 @@ class AsmGenerator:
 
     def _build_file_header(self, group_label: str,
                            functions: List[Dict]) -> List[str]:
-        ids = [f.get('function_id', 0) for f in functions if f.get('function_id')]
-        if ids:
-            min_addr = f"0x{min(ids):X}"
-            max_addr = f"0x{max(ids):X}"
-            addr_range = f"{min_addr} - {max_addr}"
+        addrs = [f.get('function_address') for f in functions
+                 if f.get('function_address') is not None]
+        if addrs:
+            addr_range = f"0x{min(addrs):X} - 0x{max(addrs):X}"
         else:
             addr_range = "unknown"
 
@@ -306,6 +305,7 @@ class AsmGenerator:
         name = func.get('function_name') or 'unknown'
         mangled = func.get('mangled_name') or ''
         func_id = func.get('function_id', 0)
+        func_addr = func.get('function_address')
         sig = func.get('function_signature_extended') or func.get('function_signature') or ''
 
         asm = func.get('assembly_code') or ''
@@ -315,8 +315,10 @@ class AsmGenerator:
             '; ' + '=' * 60,
             f'; Function: {name}',
         ]
+        if func_addr is not None:
+            lines.append(f'; Address: 0x{func_addr:X}')
         if func_id:
-            lines.append(f'; Address: 0x{func_id:X}')
+            lines.append(f'; ID: {func_id}')
         if mangled and mangled != name:
             lines.append(f'; Mangled: {mangled}')
         if sig and sig != name:
@@ -421,6 +423,7 @@ class AsmGenerator:
                 continue
             mangled = func.get('mangled_name')
             func_id = func.get('function_id')
+            func_addr = func.get('function_address')
             has_asm = bool(func.get('assembly_code'))
 
             if name in function_index:
@@ -437,6 +440,7 @@ class AsmGenerator:
                 'asm_files': [filename],
                 'library': lib_tag if is_library else CppGenerator._detect_library_tag(name, mangled),
                 'function_id': func_id,
+                'address': f"0x{func_addr:X}" if func_addr is not None else None,
                 'has_assembly': has_asm,
             }
 
@@ -461,6 +465,10 @@ class AsmGenerator:
                         existing[name]['asm_files'].append(af)
                 if 'has_assembly' not in existing[name]:
                     existing[name]['has_assembly'] = entry.get('has_assembly', False)
+                # Backfill the true start address for entries created by the
+                # C++ index path (which does not currently carry it).
+                if not existing[name].get('address') and entry.get('address'):
+                    existing[name]['address'] = entry['address']
             else:
                 existing[name] = entry
 

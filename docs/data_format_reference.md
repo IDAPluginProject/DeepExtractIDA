@@ -229,12 +229,16 @@ Note: `check_analyzed_files.py` compares flags with `force_reanalyze` removed. `
 
 | Column Name                   | Data Type | Description                                                     |
 | :---------------------------- | :-------- | :-------------------------------------------------------------- |
-| `function_id`                 | INTEGER   | Unique primary key.                                             |
+| `function_id`                 | INTEGER   | Unique primary key (sequential, assigned in address order). Not an address. |
+| `function_address`            | INTEGER   | True function start address (IDA `start_ea`). NULL for rows from pre‑v2 databases until re‑analyzed. |
+| `function_end_address`        | INTEGER   | True function end address (IDA `end_ea`). NULL for rows from pre‑v3 databases until re‑analyzed. |
+| `function_size`               | INTEGER   | Function size in bytes (`end_ea - start_ea`). NULL for rows from pre‑v3 databases until re‑analyzed. |
+| `function_flags`              | INTEGER   | Raw IDA `func.flags` (mask `FUNC_FRAME`/`FUNC_EH`/`FUNC_NORET`/`FUNC_THUNK`). NULL for rows from pre‑v3 databases until re‑analyzed. |
 | `function_signature`          | TEXT      | Demangled signature (IDA long form).                            |
 | `function_signature_extended` | TEXT      | Extended signature using IDA type info when present.            |
 | `mangled_name`                | TEXT      | Original decorated name.                                        |
 | `function_name`               | TEXT      | Raw IDA function name (may be mangled or `sub_…`).              |
-| `assembly_code`               | TEXT      | Disassembly text (capped at `MAX_ASSEMBLY_LINES`).              |
+| `assembly_code`               | TEXT      | Disassembly text, one instruction per line, each prefixed with its EA as `0x<EA>  <mnemonic operands>` (split on first whitespace to recover the EA). Capped at `MAX_ASSEMBLY_LINES`. Pre‑v3 rows lack the EA prefix until re‑analyzed. |
 | `decompiled_code`             | TEXT      | Hex‑Rays output or placeholder text on failure.                 |
 | `inbound_xrefs`               | TEXT      | Detailed JSON of inbound references.                            |
 | `outbound_xrefs`              | TEXT      | Detailed JSON of outbound calls/jumps.                          |
@@ -340,6 +344,66 @@ WHERE x.target_name LIKE '%g_pSvchostSharedGlobals%'
   AND x.xref_type = 'Read';
 ```
 
+#### Table: `imports`
+
+**Purpose**: Structured, queryable import table — the relational complement to the `file_info.imports` JSON blob. One row per imported function/ordinal. Populated atomically during extraction; cleared on re‑analysis (`DELETE` inside the extraction transaction, plus `DROP` on `--force-reanalyze`).
+
+| Column Name                  | Data Type | Description                                                                                              |
+| :--------------------------- | :-------- | :------------------------------------------------------------------------------------------------------- |
+| `id`                         | INTEGER   | **PRIMARY KEY** (autoincrement). Row identifier.                                                          |
+| `module_name`                | TEXT      | Resolved import module (DLL), post API‑set resolution.                                                    |
+| `raw_module_name`            | TEXT      | Original import module / API‑set name (pre‑resolution).                                                  |
+| `is_api_set`                 | BOOLEAN   | True when `module_name` differs from `raw_module_name` (API‑set).                                         |
+| `is_delay_loaded`             | BOOLEAN   | True for delay‑load imports (which carry `iat_ea = NULL`).                                               |
+| `function_name`               | TEXT      | Demangled/cleaned import name.                                                                          |
+| `mangled_name`               | TEXT      | Mangled/cleaned import name (always non‑empty; part of the uniqueness key).                              |
+| `ordinal`                     | INTEGER   | Import ordinal, NULL for named imports.                                                                  |
+| `iat_ea`                      | INTEGER   | Import Address Table entry EA. NULL for delay‑load imports (no fixed address until loaded).                |
+| `function_signature_extended` | TEXT      | Extended signature from IDA type info when present.                                                      |
+
+**Uniqueness constraint**: `UNIQUE(module_name, mangled_name)` deduplicates named imports (NULL ordinals are distinct in SQLite, so ordinal is excluded from the key). Insertion uses `INSERT OR IGNORE`.
+
+##### Use Cases
+
+**Import availability check** — is a dangerous API imported:
+
+```sql
+SELECT 1 FROM imports WHERE function_name = 'WinExec' AND module_name = 'kernel32.dll';
+```
+
+**Who imports an API** (cross-module):
+
+```sql
+SELECT module_name, function_name FROM imports WHERE function_name = 'LoadLibraryW';
+```
+
+#### Table: `globals`
+
+**Purpose**: Structured, module‑level global variable registry — the relational complement to the per‑function `global_var_accesses` JSON. One row per distinct global EA, enriched with size/section/writability. Aggregated from each function's raw global accesses during extraction, then bulk‑inserted inside the extraction transaction. Gated behind `--no-extract-globals` (empty when disabled). Cleared on re‑analysis.
+
+| Column Name    | Data Type | Description                                                                                  |
+| :------------- | :-------- | :------------------------------------------------------------------------------------------- |
+| `ea`           | INTEGER   | **PRIMARY KEY**. Global effective address.                                                  |
+| `name`         | TEXT      | Global name (falls back to `0x{ea:X}` when unnamed).                                        |
+| `size`         | INTEGER   | Item size from `ida_bytes.get_item_size` (0 when undefined).                                 |
+| `section`      | TEXT      | Segment name from `ida_segment.get_segm_name`.                                              |
+| `writable`     | BOOLEAN   | True when the segment has `SEGPERM_WRITE`.                                                 |
+| `access_types` | TEXT      | Comma‑joined, **sorted** set of access types seen across all functions (e.g. `Read`, `Read,Write`). |
+
+##### Use Cases
+
+**Who writes a global** (join against per‑function accesses or `function_xrefs`):
+
+```sql
+SELECT ea, name, writable FROM globals WHERE writable = 1;
+```
+
+**Is a global writable** (e.g. for `g_fUseCustomHeap`‑style analysis):
+
+```sql
+SELECT writable FROM globals WHERE name LIKE 'g_%CustomHeap%';
+```
+
 #### Table: `schema_version`
 
 | Column Name         | Data Type | Description                                     |
@@ -348,6 +412,12 @@ WHERE x.target_name LIKE '%g_pSvchostSharedGlobals%'
 | `description`       | TEXT      | Description of the schema version.              |
 | `applied_timestamp` | TIMESTAMP | When this schema version was applied.           |
 | `migration_notes`   | TEXT      | Details regarding migration from prior version. |
+
+**Schema version history**:
+
+- **v1**: initial schema.
+- **v2**: adds `functions.function_address` (true start EA). v1 DBs migrate to v2; migrated rows are NULL for `function_address` until re‑analysis.
+- **v3**: adds `functions.function_end_address`/`function_size`/`function_flags`, the `imports` and `globals` tables, and EA‑prefixed `assembly_code` lines. v2 DBs migrate to v3 (columns added non‑destructively; new tables created empty); migrated rows are NULL for the three new function columns and the new tables are empty until re‑analysis.
 
 #### Indices
 
@@ -362,6 +432,9 @@ WHERE x.target_name LIKE '%g_pSvchostSharedGlobals%'
 | `idx_fxrefs_target`        | `function_xrefs` | `target_id`                         | Fast callee lookups and inbound joins.   |
 | `idx_fxrefs_target_name`   | `function_xrefs` | `target_name COLLATE NOCASE`        | Name-based target search (e.g., imports).|
 | `idx_fxrefs_direction`     | `function_xrefs` | `direction`                         | Filter by inbound/outbound direction.    |
+| `idx_imports_func_name`   | `imports`        | `function_name COLLATE NOCASE`      | Case-insensitive import name lookups.     |
+| `idx_imports_module`       | `imports`        | `module_name COLLATE NOCASE`        | Filter/group imports by source module.   |
+| `idx_globals_name`         | `globals`        | `name COLLATE NOCASE`               | Case-insensitive global name lookups.     |
 
 ---
 

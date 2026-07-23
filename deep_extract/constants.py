@@ -279,9 +279,13 @@ def _log_unresolved_apiset(module_name: str, reason: str) -> None:
         # Avoid raising from constants module
         pass
 
-# Load Dangerous APIs (convert list back to set for O(1) lookup)
+# Load Dangerous APIs (convert list back to set for O(1) lookup).
+# Normalize to lowercase + stripped so the set keys use the SAME casing that
+# ``is_dangerous_api`` queries with (``func_name.lower()``). Without this, the
+# 92 mixed-case entries shipped in dangerous_apis.json (e.g. "CreateMutex") are
+# unreachable because the query is lowercased but the raw set keys are not.
 _dangerous_api_list = _load_json_data('dangerous_apis.json', default=[])
-DANGEROUS_API_CALLS = set(_dangerous_api_list)
+DANGEROUS_API_CALLS = {str(e).strip().lower() for e in _dangerous_api_list if str(e).strip()}
 
 
 # --- Helper Functions ---

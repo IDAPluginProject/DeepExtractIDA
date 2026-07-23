@@ -14,8 +14,8 @@ from .logging_utils import debug_print
 
 
 # Current schema version - increment when making schema changes
-CURRENT_SCHEMA_VERSION = 1
-SCHEMA_VERSION_DESCRIPTION = "Initial production schema for PE analysis"
+CURRENT_SCHEMA_VERSION = 3
+SCHEMA_VERSION_DESCRIPTION = "Add functions.function_end_address/function_size/function_flags; add imports & globals tables; assembly_code lines now prefixed with 0x<EA>"
 
 
 def get_expected_schema() -> Dict[str, List[str]]:
@@ -69,6 +69,10 @@ def get_expected_schema() -> Dict[str, List[str]]:
         ],
         'functions': [
             'function_id INTEGER PRIMARY KEY',
+            'function_address INTEGER',
+            'function_end_address INTEGER',
+            'function_size INTEGER',
+            'function_flags INTEGER',
             'function_signature TEXT NOT NULL',
             'function_signature_extended TEXT',
             'mangled_name TEXT NOT NULL',
@@ -98,6 +102,27 @@ def get_expected_schema() -> Dict[str, List[str]]:
             'xref_type TEXT',
             'direction TEXT NOT NULL',
             'UNIQUE(source_id, target_id, target_name, target_module, xref_type, direction)',
+        ],
+        'imports': [
+            'id INTEGER PRIMARY KEY AUTOINCREMENT',
+            'module_name TEXT',
+            'raw_module_name TEXT',
+            'is_api_set BOOLEAN',
+            'is_delay_loaded BOOLEAN',
+            'function_name TEXT',
+            'mangled_name TEXT',
+            'ordinal INTEGER',
+            'iat_ea INTEGER',
+            'function_signature_extended TEXT',
+            'UNIQUE(module_name, mangled_name)',
+        ],
+        'globals': [
+            'ea INTEGER PRIMARY KEY',
+            'name TEXT',
+            'size INTEGER',
+            'section TEXT',
+            'writable BOOLEAN',
+            'access_types TEXT',
         ]
     }
 
@@ -185,13 +210,22 @@ def validate_schema_structure(conn: sqlite3.Connection) -> Tuple[bool, List[str]
             cursor.execute(f"PRAGMA table_info({table_name})")
             actual_columns = {row[1] for row in cursor.fetchall()}  # row[1] is column name
             
-            # Extract expected column names (parse column definitions)
+            # Extract expected column names (parse column definitions).
+            # Skip table-level constraints, which may appear either space-
+            # separated ("PRIMARY KEY (...)") or attached to a paren
+            # ("UNIQUE(source_id, ...)").
+            _CONSTRAINT_KEYWORDS = ('PRIMARY', 'FOREIGN', 'UNIQUE', 'CHECK', 'CONSTRAINT')
             expected_column_names = set()
             for col_def in expected_columns:
-                # Split on space and take first part (column name)
                 parts = col_def.strip().split()
-                if parts and parts[0] not in ('PRIMARY', 'FOREIGN', 'UNIQUE', 'CHECK'):
-                    expected_column_names.add(parts[0])
+                if not parts:
+                    continue
+                # Normalize the first token: drop anything from an opening
+                # paren onward so "UNIQUE(source_id," -> "UNIQUE".
+                first_token = parts[0].split('(', 1)[0].upper()
+                if first_token in _CONSTRAINT_KEYWORDS:
+                    continue
+                expected_column_names.add(parts[0])
             
             # Check for missing columns
             missing_columns = expected_column_names - actual_columns
@@ -244,6 +278,95 @@ def initialize_schema_version(conn: sqlite3.Connection, version: int = CURRENT_S
         return False
 
 
+def _migrate_v1_to_v2(conn: sqlite3.Connection) -> bool:
+    """v1 -> v2: add the functions.function_address column (true start EA).
+
+    Existing rows are left with NULL addresses; a re-analysis is required to
+    backfill them.  The column is added non-destructively so prior extraction
+    data (assembly, decompilation, xrefs) is preserved.
+    """
+    try:
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(functions)")
+        columns = {row[1] for row in cursor.fetchall()}
+        if 'function_address' not in columns:
+            with conn:
+                conn.execute("ALTER TABLE functions ADD COLUMN function_address INTEGER")
+            debug_print("Migration v1->v2: added functions.function_address column")
+        else:
+            debug_print("Migration v1->v2: function_address column already present")
+        return True
+    except Exception as e:
+        debug_print(f"ERROR - Migration v1->v2 failed: {str(e)}")
+        return False
+
+
+def _migrate_v2_to_v3(conn: sqlite3.Connection) -> bool:
+    """v2 -> v3: add function_end_address/function_size/function_flags columns
+    and create the imports & globals tables.
+
+    Existing rows are left with NULL for the three new function columns; a
+    re-analysis is required to backfill them (the columns are added
+    non-destructively so prior extraction data is preserved, mirroring the
+    v1->v2 function_address migration). The imports/globals tables are
+    created empty for migrated DBs and are populated on the next extraction.
+    """
+    try:
+        cursor = conn.cursor()
+        # Add the three new function columns idempotently.
+        cursor.execute("PRAGMA table_info(functions)")
+        columns = {row[1] for row in cursor.fetchall()}
+        new_function_cols = (
+            ("function_end_address", "INTEGER"),
+            ("function_size", "INTEGER"),
+            ("function_flags", "INTEGER"),
+        )
+        with conn:
+            for col_name, col_type in new_function_cols:
+                if col_name not in columns:
+                    conn.execute(
+                        f"ALTER TABLE functions ADD COLUMN {col_name} {col_type}"
+                    )
+                    debug_print(f"Migration v2->v3: added functions.{col_name} column")
+                else:
+                    debug_print(f"Migration v2->v3: {col_name} column already present")
+        # Create the imports table if absent.
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS imports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                module_name TEXT,
+                raw_module_name TEXT,
+                is_api_set BOOLEAN,
+                is_delay_loaded BOOLEAN,
+                function_name TEXT,
+                mangled_name TEXT,
+                ordinal INTEGER,
+                iat_ea INTEGER,
+                function_signature_extended TEXT,
+                UNIQUE(module_name, mangled_name)
+            )
+        ''')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_imports_func_name ON imports(function_name COLLATE NOCASE)')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_imports_module ON imports(module_name COLLATE NOCASE)')
+        # Create the globals table if absent.
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS globals (
+                ea INTEGER PRIMARY KEY,
+                name TEXT,
+                size INTEGER,
+                section TEXT,
+                writable BOOLEAN,
+                access_types TEXT
+            )
+        ''')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_globals_name ON globals(name COLLATE NOCASE)')
+        debug_print("Migration v2->v3: imports/globals tables ensured")
+        return True
+    except Exception as e:
+        debug_print(f"ERROR - Migration v2->v3 failed: {str(e)}")
+        return False
+
+
 def migrate_schema(conn: sqlite3.Connection, from_version: int, to_version: int) -> bool:
     """
     Migrates database schema from one version to another.
@@ -261,7 +384,8 @@ def migrate_schema(conn: sqlite3.Connection, from_version: int, to_version: int)
     try:
         # Define migration paths
         migrations = {
-            # Future migrations will be added here when schema changes are needed
+            (1, 2): _migrate_v1_to_v2,
+            (2, 3): _migrate_v2_to_v3,
         }
         
         # Execute migrations in sequence

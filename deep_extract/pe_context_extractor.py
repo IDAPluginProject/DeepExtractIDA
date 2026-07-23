@@ -34,6 +34,7 @@ try:
     from . import json_safety
     from . import module_profile as _module_profile
     from . import schema
+    from .imports_globals_helpers import flatten_imports_rows, merge_global_access
     from .config import AnalysisConfig
     from .logging_utils import debug_print, get_log_level
 except ImportError:
@@ -56,6 +57,7 @@ except ImportError:
     from extraction_tool import json_safety
     from extraction_tool import module_profile as _module_profile
     from extraction_tool import schema
+    from extraction_tool.imports_globals_helpers import flatten_imports_rows, merge_global_access
     from extraction_tool.config import AnalysisConfig
     from extraction_tool.logging_utils import debug_print, get_log_level
 
@@ -287,6 +289,8 @@ def init_sqlite_db(db_path: str, force_reanalyze: bool = False, pragmas: Optiona
                 conn.execute('DROP TABLE IF EXISTS file_info')
                 conn.execute('DROP TABLE IF EXISTS schema_version')
                 conn.execute('DROP TABLE IF EXISTS function_xrefs')
+                conn.execute('DROP TABLE IF EXISTS imports')
+                conn.execute('DROP TABLE IF EXISTS globals')
 
             # Create schema_version table first
             conn.execute('''
@@ -347,6 +351,10 @@ def init_sqlite_db(db_path: str, force_reanalyze: bool = False, pragmas: Optiona
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS functions (
                     function_id INTEGER PRIMARY KEY,
+                    function_address INTEGER,
+                    function_end_address INTEGER,
+                    function_size INTEGER,
+                    function_flags INTEGER,
                     function_signature TEXT NOT NULL,
                     function_signature_extended TEXT,
                     mangled_name TEXT NOT NULL,
@@ -399,7 +407,39 @@ def init_sqlite_db(db_path: str, force_reanalyze: bool = False, pragmas: Optiona
             conn.execute('CREATE INDEX IF NOT EXISTS idx_fxrefs_target ON function_xrefs(target_id)')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_fxrefs_target_name ON function_xrefs(target_name COLLATE NOCASE)')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_fxrefs_direction ON function_xrefs(direction)')
-        
+
+            # Structured import table (queryable complement to file_info.imports JSON blob)
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS imports (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    module_name TEXT,
+                    raw_module_name TEXT,
+                    is_api_set BOOLEAN,
+                    is_delay_loaded BOOLEAN,
+                    function_name TEXT,
+                    mangled_name TEXT,
+                    ordinal INTEGER,
+                    iat_ea INTEGER,
+                    function_signature_extended TEXT,
+                    UNIQUE(module_name, mangled_name)
+                )
+            ''')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_imports_func_name ON imports(function_name COLLATE NOCASE)')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_imports_module ON imports(module_name COLLATE NOCASE)')
+
+            # Structured module-level globals table (queryable complement to per-function global_var_accesses JSON)
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS globals (
+                    ea INTEGER PRIMARY KEY,
+                    name TEXT,
+                    size INTEGER,
+                    section TEXT,
+                    writable BOOLEAN,
+                    access_types TEXT
+                )
+            ''')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_globals_name ON globals(name COLLATE NOCASE)')
+
         duration = time.time() - start_time
         debug_print(f"TRACE - Finished: init_sqlite_db. Duration: {duration:.4f}s")
         return True
@@ -1098,7 +1138,7 @@ def _process_single_function(ea: int, string_map: Dict[int, Any], has_decompiler
                 break
             disasm = ida_lines.tag_remove(ida_lines.generate_disasm_line(curr_ea))
             if disasm:
-                assembly_lines.append(disasm)
+                assembly_lines.append(f"0x{curr_ea:X}  {disasm}")
         _profile_add_stage(profile, "assembly", time.perf_counter() - assembly_start, ea, demangled_name)
         
         if len(assembly_lines) >= constants.MAX_ASSEMBLY_LINES:
@@ -1333,6 +1373,10 @@ def _process_single_function(ea: int, string_map: Dict[int, Any], has_decompiler
         # Build entry
         return {
             'function_id': addr_to_id.get(ea),
+            'function_address': func.start_ea,
+            'function_end_address': func.end_ea,
+            'function_size': func.end_ea - func.start_ea,
+            'function_flags': int(func.flags),
             'function_signature': demangled_name,
             'function_signature_extended': extended_signature,
             'mangled_name': mangled_name,
@@ -1360,11 +1404,13 @@ def _process_single_function(ea: int, string_map: Dict[int, Any], has_decompiler
             'analysis_errors': json_safety.to_json_safe(analysis_errors, max_list_items=100, field_name="analysis_errors"),
             '_raw_simple_inbound': simple_inbound,
             '_raw_simple_outbound': simple_outbound,
+            '_raw_global_accesses': global_accesses,
         }
 
     except Exception as e:
         debug_print(f"ERROR - Processing function 0x{ea:X}: {str(e)}")
         return None
+
 
 def extract_all_functions(sqlite_db_path, hashes, imports_json, exports_json, entry_points_json, version_info, pe_metadata, advanced_pe_info, runtime_info, file_modified_date_str, idb_cache_path, has_decompiler, db_pragmas: Optional[Dict[str, Any]] = None, **kwargs):
     """
@@ -1503,8 +1549,25 @@ def extract_all_functions(sqlite_db_path, hashes, imports_json, exports_json, en
             try:
                 cursor.execute('DELETE FROM functions')
                 cursor.execute('DELETE FROM function_xrefs')
+                cursor.execute('DELETE FROM imports')
+                cursor.execute('DELETE FROM globals')
+                # Populate structured imports table (atomic with the rest of extraction).
+                try:
+                    imports_data = json.loads(imports_json) if imports_json else []
+                    imports_rows = flatten_imports_rows(imports_data)
+                    if imports_rows:
+                        cursor.executemany('''
+                            INSERT OR IGNORE INTO imports (
+                                module_name, raw_module_name, is_api_set, is_delay_loaded,
+                                function_name, mangled_name, ordinal, iat_ea,
+                                function_signature_extended
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ''', imports_rows)
+                except Exception as imp_err:
+                    debug_print(f"WARNING - imports table population failed: {imp_err}")
                 cursor.execute('SAVEPOINT batch_sp')
                 batch_count = 0
+                global_acc = {}
                 
                 for idx, ea in enumerate(function_addresses):
                     func_total_start = time.perf_counter()
@@ -1520,18 +1583,24 @@ def extract_all_functions(sqlite_db_path, hashes, imports_json, exports_json, en
                         # Extract raw xref lists before DB insert (not in functions table schema)
                         raw_inbound = func_data.pop('_raw_simple_inbound', [])
                         raw_outbound = func_data.pop('_raw_simple_outbound', [])
+                        raw_global_accesses = func_data.pop('_raw_global_accesses', [])
                         func_id = func_data['function_id']
+                        # Accumulate module-level globals (enriched after the loop).
+                        if options.get('extract_globals'):
+                            merge_global_access(global_acc, raw_global_accesses)
 
                         insert_start = time.perf_counter()
                         cursor.execute('''
                             INSERT INTO functions (
-                                function_id, function_signature, function_signature_extended, mangled_name, function_name,
+                                function_id, function_address, function_end_address, function_size, function_flags,
+                                function_signature, function_signature_extended, mangled_name, function_name,
                                 assembly_code, decompiled_code, inbound_xrefs, outbound_xrefs,
                                 simple_inbound_xrefs, simple_outbound_xrefs,
                                 vtable_contexts, global_var_accesses, loop_analysis, stack_frame,
                                 string_literals, dangerous_api_calls, analysis_errors
                             ) VALUES (
-                                :function_id, :function_signature, :function_signature_extended, :mangled_name, :function_name,
+                                :function_id, :function_address, :function_end_address, :function_size, :function_flags,
+                                :function_signature, :function_signature_extended, :mangled_name, :function_name,
                                 :assembly_code, :decompiled_code, :inbound_xrefs, :outbound_xrefs,
                                 :simple_inbound_xrefs, :simple_outbound_xrefs,
                                 :vtable_contexts, :global_var_accesses, :loop_analysis, :stack_frame,
@@ -1580,6 +1649,39 @@ def extract_all_functions(sqlite_db_path, hashes, imports_json, exports_json, en
                         progress.update(functions_processed_count)
                         progress.log_progress(batch_num=current_batch)
                 
+                # Populate structured globals table (enrich with IDA segment/item info).
+                if options.get('extract_globals') and global_acc:
+                    try:
+                        import ida_segment as _ida_segment
+                        import ida_bytes as _ida_bytes
+                        global_rows = []
+                        for ea, info in global_acc.items():
+                            seg = _ida_segment.getseg(ea)
+                            if seg is None:
+                                continue
+                            writable = bool(seg.perm & _ida_segment.SEGPERM_WRITE)
+                            section = _ida_segment.get_segm_name(seg)
+                            try:
+                                size = int(_ida_bytes.get_item_size(ea))
+                            except Exception:
+                                size = 0
+                            global_rows.append((
+                                ea,
+                                info.get('name') or f"0x{ea:X}",
+                                size,
+                                section,
+                                writable,
+                                ",".join(sorted(info.get('access_types', set()))),
+                            ))
+                        if global_rows:
+                            cursor.executemany('''
+                                INSERT OR REPLACE INTO globals (
+                                    ea, name, size, section, writable, access_types
+                                ) VALUES (?, ?, ?, ?, ?, ?)
+                            ''', global_rows)
+                    except Exception as glob_err:
+                        debug_print(f"WARNING - globals table population failed: {glob_err}")
+
                 final_commit_start = time.perf_counter()
                 cursor.execute('COMMIT')
                 _profile_add_stage(profile, "db_commit", time.perf_counter() - final_commit_start)
@@ -1844,13 +1946,13 @@ def generate_asm_output_files(config: AnalysisConfig, sqlite_db_path: str) -> in
             cursor = conn.cursor()
 
             _ASM_COLS = (
-                'function_id', 'function_name', 'function_signature',
+                'function_id', 'function_address', 'function_name', 'function_signature',
                 'function_signature_extended', 'mangled_name',
                 'assembly_code', 'simple_inbound_xrefs', 'simple_outbound_xrefs',
                 'string_literals', 'dangerous_api_calls',
             )
             cursor.execute('''
-                SELECT function_id, function_name, function_signature,
+                SELECT function_id, function_address, function_name, function_signature,
                        function_signature_extended, mangled_name,
                        assembly_code, simple_inbound_xrefs, simple_outbound_xrefs,
                        string_literals, dangerous_api_calls

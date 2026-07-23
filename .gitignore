@@ -80,3 +80,8 @@ Desktop.ini
 # Project-specific
 # -------------------------
 references/
+.smoke_test/
+.protocol_runs/
+todo/
+work/
+test.txt

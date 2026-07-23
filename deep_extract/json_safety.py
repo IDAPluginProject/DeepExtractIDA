@@ -347,6 +347,16 @@ def _make_serializable(obj: Any, max_list_items: int, max_dict_keys: int,
     except Exception:
         pass
     
+    # Handle enums (MUST precede the __dict__ handler below: Enum members have
+    # __dict__, so checking __dict__ first would shadow this branch and serialize
+    # the member's internal dict (_value_/_name_/...) instead of obj.value).
+    try:
+        from enum import Enum
+        if isinstance(obj, Enum):
+            return obj.value
+    except ImportError:
+        pass
+
     # Handle objects with __dict__ (custom classes)
     if hasattr(obj, '__dict__'):
         try:
@@ -354,15 +364,7 @@ def _make_serializable(obj: Any, max_list_items: int, max_dict_keys: int,
                                     max_string_length, drop_keys, metadata, depth + 1, truncate_lists)
         except Exception:
             return str(obj)
-    
-    # Handle enums
-    try:
-        from enum import Enum
-        if isinstance(obj, Enum):
-            return obj.value
-    except ImportError:
-        pass
-    
+
     # Fallback to string representation
     try:
         str_repr = str(obj)
